@@ -284,24 +284,94 @@ def evaluate_defenses(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, choices=["standard", "robust"], default="standard")
-    parser.add_argument("--image_dir", type=str, default=None)
-    parser.add_argument("--image", type=str, default="example.jpg")
-    parser.add_argument("--attacks", type=str, nargs="+", default=["fgsm", "pgd", "cw"])
-    parser.add_argument("--eps_list", type=float, nargs="+", default=[4 / 255, 8 / 255, 16 / 255])
-    parser.add_argument("--alpha", type=float, default=2 / 255)
-    parser.add_argument("--steps", type=int, default=10)
-    parser.add_argument("--cw_c", type=float, default=1.0)
-    parser.add_argument("--cw_kappa", type=float, default=0.0)
-    parser.add_argument("--cw_steps", type=int, default=100)
-    parser.add_argument("--cw_lr", type=float, default=0.01)
-    parser.add_argument("--detector_threshold", type=float, default=None)
-    parser.add_argument("--calibrate_dir", type=str, default=None)
-    parser.add_argument("--calibrate_n", type=int, default=100)
-    parser.add_argument("--calibrate_quantile", type=float, default=0.99)
-    parser.add_argument("--use_jpeg", action="store_true")
-    parser.add_argument("--jpeg_quality", type=int, default=75)
+    parser = argparse.ArgumentParser()  # 创建命令行参数解析器
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["standard", "robust"],
+        default="standard",
+    )  # 选择使用标准模型还是鲁棒模型
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+    )  # 包含待测试图片的文件夹路径（与 --image 二选一）
+    parser.add_argument(
+        "--image",
+        type=str,
+        default="example.jpg",
+    )  # 单张待测试图片路径（当未指定 --image_dir 时生效）
+    parser.add_argument(
+        "--attacks",
+        type=str,
+        nargs="+",
+        default=["fgsm", "pgd", "cw"],
+    )  # 要运行的攻击方法列表
+    parser.add_argument(
+        "--eps_list",
+        type=float,
+        nargs="+",
+        default=[4 / 255, 8 / 255, 16 / 255],
+    )  # FGSM/PGD 等 \(L_\infty\) 攻击的扰动半径列表
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=2 / 255,
+    )  # PGD 每一步的步长
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=10,
+    )  # 迭代型攻击（如 PGD）的迭代步数
+    parser.add_argument(
+        "--cw_c",
+        type=float,
+        default=1.0,
+    )  # CW 攻击中损失函数前的权重系数 \(c\)
+    parser.add_argument(
+        "--cw_kappa",
+        type=float,
+        default=0.0,
+    )  # CW 攻击中的置信度参数 \(\kappa\)
+    parser.add_argument(
+        "--cw_steps",
+        type=int,
+        default=100,
+    )  # CW 攻击的最大迭代步数
+    parser.add_argument(
+        "--cw_lr",
+        type=float,
+        default=0.01,
+    )  # CW 攻击中优化变量的学习率
+    parser.add_argument(
+        "--detector_threshold",
+        type=float,
+        default=None,
+    )  # 特征空间检测器判定对抗样本的阈值（None 表示使用默认或自动校准）
+    parser.add_argument(
+        "--calibrate_dir",
+        type=str,
+        default=None,
+    )  # 用于阈值校准的干净样本目录
+    parser.add_argument(
+        "--calibrate_n",
+        type=int,
+        default=100,
+    )  # 用于校准的样本数量上限
+    parser.add_argument(
+        "--calibrate_quantile",
+        type=float,
+        default=0.99,
+    )  # 设置阈值时使用的分位数（越大越保守）
+    parser.add_argument(
+        "--use_jpeg",
+        action="store_true",
+    )  # 是否在输入前添加 JPEG 压缩作为预处理防御
+    parser.add_argument(
+        "--jpeg_quality",
+        type=int,
+        default=75,
+    )  # JPEG 压缩质量（数值越低压缩越强）
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
