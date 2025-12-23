@@ -324,6 +324,9 @@ def main() -> None:
         image_paths = [image_path]
 
     mean, std = get_mean_std(device, torch.float32)
+    if args.model_type == "robust":
+        mean = torch.zeros_like(mean)
+        std = torch.ones_like(std)
 
     global _DEFENSE_USE_JPEG, _DEFENSE_JPEG_QUALITY
     _DEFENSE_USE_JPEG = bool(args.use_jpeg)

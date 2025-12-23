@@ -6,7 +6,7 @@
 - ResNet.py 为图像识别程序文件、包含了攻击方法的实现
 - attack.py 为攻击方法的实现文件
 - defense_experiment.py 为防御实验程序文件
-- example.jpg为样例图像
+- picture 文件夹为实验图片文件夹
 - adv_fgsm.png 为FGSM攻击生成的对抗样本
 - adv_pgd.png 为PGD攻击生成的对抗样本
 - adv_cw.png 为CW-L2攻击生成的对抗样本
@@ -17,6 +17,14 @@
 - torchattacks
 - PIL
 - matplotlib
+- robustbench
+- autoattack(下载：pip install git+https://github.com/fra31/auto-attack)
+
+## 如何进行图像识别
+- 只做正常预测：
+```bash
+python ResNet.py picture
+```
 
 ## 如何进行攻击运行
 - 只做正常预测：
@@ -50,4 +58,21 @@ attack=fgsm, eps=0.01569, attack_success=0.000, smooth_defense_acc=1.000, quant_
 attack=fgsm, eps=0.03137, attack_success=0.000, smooth_defense_acc=1.000, quant_defense_acc=1.000, detector_clean_pass_rate=1.000, detector_adv_flag_rate=0.000, detector_attack_success=0.000
 attack=pgd, eps=0.01569, attack_success=1.000, smooth_defense_acc=1.000, quant_defense_acc=0.000, detector_clean_pass_rate=1.000, detector_adv_flag_rate=0.000, detector_attack_success=1.000
 attack=pgd, eps=0.03137, attack_success=1.000, smooth_defense_acc=0.000, quant_defense_acc=0.000, detector_clean_pass_rate=1.000, detector_adv_flag_rate=0.000, detector_attack_success=1.000
+```
+
+## 如何进行防御实验
+- 对比攻击前和攻击后的模型预测结果：
+```bash
+python defense_experiments.py `
+  --model_type standard `
+  --image_dir picture `
+  --attacks fgsm pgd `
+  --eps_list 0.015686275 0.031372549
+```
+```bash
+python defense_experiments.py `
+  --model_type robust `
+  --image_dir picture `
+  --attacks fgsm pgd `
+  --eps_list 0.015686275 0.031372549
 ```
