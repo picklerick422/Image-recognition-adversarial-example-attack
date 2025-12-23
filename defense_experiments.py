@@ -1,4 +1,5 @@
 import argparse
+import io
 from pathlib import Path
 
 import torch
@@ -10,8 +11,28 @@ from PIL import Image
 from attack import cw_l2_attack, fgsm_attack, normalize_batch, pgd_linf_attack
 
 
-def load_model(device: torch.device) -> torch.nn.Module:
-    model = models.resnet50(pretrained=True).eval()
+def load_model(device: torch.device, model_type: str = "standard") -> torch.nn.Module:
+    if model_type == "robust":
+        try:
+            from robustbench import load_model as rb_load_model
+
+            model = rb_load_model(
+                model_name="Engstrom2019Robustness",
+                dataset="imagenet",
+                threat_model="Linf",
+            ).eval()
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load robust model from RobustBench. "
+                "Ensure robustbench and autoattack are installed and model_name is valid."
+            ) from e
+    else:
+        try:
+            from torchvision.models import ResNet50_Weights
+
+            model = models.resnet50(weights=ResNet50_Weights.DEFAULT).eval()
+        except Exception:
+            model = models.resnet50(pretrained=True).eval()
     return model.to(device)
 
 
@@ -43,19 +64,116 @@ def predict(model: torch.nn.Module, x: torch.Tensor, mean: torch.Tensor, std: to
     return logits
 
 
-def defense_smoothing(x: torch.Tensor) -> torch.Tensor:
+_DEFENSE_USE_JPEG = False
+_DEFENSE_JPEG_QUALITY = 75
+
+
+def _defense_smoothing(x: torch.Tensor) -> torch.Tensor:
     return F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
 
 
-def defense_quantization(x: torch.Tensor, levels: int = 16) -> torch.Tensor:
+def _defense_quantization(x: torch.Tensor, levels: int = 16) -> torch.Tensor:
     x_clamped = x.clamp(0.0, 1.0)
     return torch.round(x_clamped * (levels - 1)) / (levels - 1)
 
 
-def detector_max_confidence(logits: torch.Tensor, threshold: float) -> torch.Tensor:
-    prob = torch.softmax(logits, dim=1)
-    max_conf, _ = prob.max(dim=1)
-    return max_conf < threshold
+def _jpeg_compress_batch(x: torch.Tensor, quality: int) -> torch.Tensor:
+    x_in = x.clamp(0.0, 1.0)
+    device = x_in.device
+    dtype = x_in.dtype
+    x_cpu = x_in.detach().to("cpu")
+
+    to_pil = transforms.ToPILImage()
+    to_tensor = transforms.ToTensor()
+    out = torch.empty_like(x_cpu)
+
+    for i in range(x_cpu.shape[0]):
+        img = to_pil(x_cpu[i])
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=int(quality))
+        buf.seek(0)
+        img_jpeg = Image.open(buf).convert("RGB")
+        out[i] = to_tensor(img_jpeg)
+
+    return out.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+
+
+def defend_input(x: torch.Tensor) -> torch.Tensor:
+    """输入预处理防御：组合平滑 + 量化 + JPEG"""
+    x01 = x.clamp(0.0, 1.0)
+    x01 = _defense_smoothing(x01)
+    x01 = _defense_quantization(x01, levels=16)
+    if _DEFENSE_USE_JPEG:
+        x01 = _jpeg_compress_batch(x01, quality=_DEFENSE_JPEG_QUALITY)
+    return x01.clamp(0.0, 1.0)
+
+
+def _layer3_features(model: torch.nn.Module, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    x_norm = normalize_batch(x, mean, std)
+    with torch.no_grad():
+        if hasattr(model, "conv1") and hasattr(model, "layer3"):
+            x1 = model.conv1(x_norm)
+            x1 = model.bn1(x1)
+            x1 = model.relu(x1)
+            x1 = model.maxpool(x1)
+            x1 = model.layer1(x1)
+            x1 = model.layer2(x1)
+            x1 = model.layer3(x1)
+            return x1
+        feats = model(x_norm)
+        if feats.ndim == 2:
+            b, c = feats.shape
+            return feats.view(b, c, 1, 1)
+        if feats.ndim == 4:
+            return feats
+        b = feats.shape[0]
+        return feats.view(b, -1, 1, 1)
+
+
+def is_adversarial_by_feature(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """基于 ResNet50 layer3 特征范数的检测器"""
+    feats = _layer3_features(model, x, mean, std)
+    b = feats.shape[0]
+    l2 = feats.view(b, -1).pow(2).sum(dim=1).sqrt()
+    ch_var = feats.var(dim=(2, 3), unbiased=False).mean(dim=1)
+    score = l2 + ch_var
+    return score > float(threshold)
+
+
+def calibrate_feature_threshold(
+    model: torch.nn.Module,
+    image_paths: list[Path],
+    *,
+    device: torch.device,
+    transform: transforms.Compose,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    n: int = 100,
+    quantile: float = 0.99,
+) -> float:
+    scores = []
+    num = min(int(n), len(image_paths))
+    if num <= 0:
+        raise ValueError("no calibration images available")
+
+    for p in image_paths[:num]:
+        x = load_image(p, device, transform)
+        feats = _layer3_features(model, x, mean, std)
+        l2 = feats.view(1, -1).pow(2).sum(dim=1).sqrt()
+        ch_var = feats.var(dim=(2, 3), unbiased=False).mean(dim=1)
+        score = (l2 + ch_var).detach().to("cpu")
+        scores.append(score)
+
+    s = torch.cat(scores, dim=0).to(dtype=torch.float32)
+    q = float(quantile)
+    q = max(0.0, min(1.0, q))
+    return float(torch.quantile(s, q).item())
 
 
 def run_attack(
@@ -142,20 +260,15 @@ def evaluate_defenses(
     pred_adv = logits_adv.argmax(dim=1)
     attack_success = int(pred_adv != y_true)
 
-    x_adv_smooth = defense_smoothing(x_adv)
-    logits_smooth = predict(model, x_adv_smooth, mean, std)
-    pred_smooth = logits_smooth.argmax(dim=1)
-    defense_smooth_success = int(pred_smooth == y_true)
+    x_adv_def = defend_input(x_adv)
+    logits_def = predict(model, x_adv_def, mean, std)
+    pred_def = logits_def.argmax(dim=1)
+    defense_preproc_success = int(pred_def == y_true)
 
-    x_adv_quant = defense_quantization(x_adv)
-    logits_quant = predict(model, x_adv_quant, mean, std)
-    pred_quant = logits_quant.argmax(dim=1)
-    defense_quant_success = int(pred_quant == y_true)
+    detected_adv = is_adversarial_by_feature(model, x_adv, mean, std, detector_threshold)
+    detector_flags_adv = int(detected_adv.item())
 
-    detected = detector_max_confidence(logits_adv, detector_threshold)
-    detector_flags_adv = int(detected.item())
-
-    detected_clean = detector_max_confidence(logits_clean, detector_threshold)
+    detected_clean = is_adversarial_by_feature(model, x, mean, std, detector_threshold)
     detector_flags_clean = int(detected_clean.item())
 
     detector_attack_success = int((attack_success == 1) and (detector_flags_adv == 0))
@@ -163,8 +276,7 @@ def evaluate_defenses(
     return {
         "clean_correct": clean_correct,
         "attack_success": attack_success,
-        "defense_smooth_success": defense_smooth_success,
-        "defense_quant_success": defense_quant_success,
+        "defense_preproc_success": defense_preproc_success,
         "detector_flags_clean": detector_flags_clean,
         "detector_flags_adv": detector_flags_adv,
         "detector_attack_success": detector_attack_success,
@@ -173,6 +285,7 @@ def evaluate_defenses(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model_type", type=str, choices=["standard", "robust"], default="standard")
     parser.add_argument("--image_dir", type=str, default=None)
     parser.add_argument("--image", type=str, default="example.jpg")
     parser.add_argument("--attacks", type=str, nargs="+", default=["fgsm", "pgd", "cw"])
@@ -183,11 +296,16 @@ def main() -> None:
     parser.add_argument("--cw_kappa", type=float, default=0.0)
     parser.add_argument("--cw_steps", type=int, default=100)
     parser.add_argument("--cw_lr", type=float, default=0.01)
-    parser.add_argument("--detector_threshold", type=float, default=0.9)
+    parser.add_argument("--detector_threshold", type=float, default=None)
+    parser.add_argument("--calibrate_dir", type=str, default=None)
+    parser.add_argument("--calibrate_n", type=int, default=100)
+    parser.add_argument("--calibrate_quantile", type=float, default=0.99)
+    parser.add_argument("--use_jpeg", action="store_true")
+    parser.add_argument("--jpeg_quality", type=int, default=75)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(device)
+    model = load_model(device, model_type=args.model_type)
     transform = get_transform()
 
     if args.image_dir is not None:
@@ -207,6 +325,44 @@ def main() -> None:
 
     mean, std = get_mean_std(device, torch.float32)
 
+    global _DEFENSE_USE_JPEG, _DEFENSE_JPEG_QUALITY
+    _DEFENSE_USE_JPEG = bool(args.use_jpeg)
+    _DEFENSE_JPEG_QUALITY = int(args.jpeg_quality)
+
+    if args.calibrate_dir is not None:
+        calib_dir = Path(args.calibrate_dir)
+        if not calib_dir.is_dir():
+            raise SystemExit(f"calibrate_dir not found: {calib_dir}")
+        calib_paths = sorted(
+            [p for p in calib_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}]
+        )
+        if not calib_paths:
+            raise SystemExit(f"no images found in calibrate_dir: {calib_dir}")
+        detector_threshold = calibrate_feature_threshold(
+            model,
+            calib_paths,
+            device=device,
+            transform=transform,
+            mean=mean,
+            std=std,
+            n=int(args.calibrate_n),
+            quantile=float(args.calibrate_quantile),
+        )
+    else:
+        if args.detector_threshold is not None:
+            detector_threshold = float(args.detector_threshold)
+        else:
+            detector_threshold = calibrate_feature_threshold(
+                model,
+                image_paths,
+                device=device,
+                transform=transform,
+                mean=mean,
+                std=std,
+                n=min(100, len(image_paths)),
+                quantile=float(args.calibrate_quantile),
+            )
+
     results = {}
     for attack_name in args.attacks:
         if attack_name not in {"fgsm", "pgd", "cw"}:
@@ -216,8 +372,7 @@ def main() -> None:
             stats = {
                 "clean_correct": 0,
                 "attack_success": 0,
-                "defense_smooth_success": 0,
-                "defense_quant_success": 0,
+                "defense_preproc_success": 0,
                 "detector_flags_clean": 0,
                 "detector_flags_adv": 0,
                 "detector_attack_success": 0,
@@ -242,7 +397,7 @@ def main() -> None:
                     cw_kappa=float(args.cw_kappa),
                     cw_steps=int(args.cw_steps),
                     cw_lr=float(args.cw_lr),
-                    detector_threshold=float(args.detector_threshold),
+                    detector_threshold=float(detector_threshold),
                 )
 
                 for k in stats:
@@ -256,8 +411,7 @@ def main() -> None:
     for (attack_name, eps), stats in sorted(results.items()):
         count = max(1, stats["count"])
         attack_success_rate = stats["attack_success"] / count
-        smooth_acc = stats["defense_smooth_success"] / count
-        quant_acc = stats["defense_quant_success"] / count
+        preproc_acc = stats["defense_preproc_success"] / count
         detector_clean_rate = 1.0 - stats["detector_flags_clean"] / count
         detector_adv_flag_rate = stats["detector_flags_adv"] / count
         detector_attack_success_rate = stats["detector_attack_success"] / count
@@ -265,8 +419,7 @@ def main() -> None:
         print(
             f"attack={attack_name}, eps={eps:.5f}, "
             f"attack_success={attack_success_rate:.3f}, "
-            f"smooth_defense_acc={smooth_acc:.3f}, "
-            f"quant_defense_acc={quant_acc:.3f}, "
+            f"preproc_defense_acc={preproc_acc:.3f}, "
             f"detector_clean_pass_rate={detector_clean_rate:.3f}, "
             f"detector_adv_flag_rate={detector_adv_flag_rate:.3f}, "
             f"detector_attack_success={detector_attack_success_rate:.3f}"
@@ -275,4 +428,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
