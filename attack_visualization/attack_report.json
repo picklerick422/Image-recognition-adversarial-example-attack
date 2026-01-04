@@ -1,0 +1,56 @@
+{
+  "image": "picture\\example.jpg",
+  "model": "resnet50",
+  "clean_prediction": {
+    "class_id": 388,
+    "class_name": "giant panda",
+    "confidence": 0.39765632152557373
+  },
+  "attacks": {
+    "fgsm": {
+      "predicted_class": 388,
+      "predicted_name": "giant panda",
+      "confidence": 0.17794620990753174,
+      "success": false,
+      "metrics": {
+        "L\u221e (pixel)": 0.03137001395225525,
+        "L2": 12.169955253601074,
+        "L1": 4721.6494140625,
+        "SSIM": 0.0,
+        "PSNR": 30.07084427479348,
+        "Perturbed Pixels %": 100.0,
+        "High Freq Ratio": 99.97408986091614
+      }
+    },
+    "pgd": {
+      "predicted_class": 362,
+      "predicted_name": "badger",
+      "confidence": 0.9995555281639099,
+      "success": true,
+      "metrics": {
+        "L\u221e (pixel)": 0.03137001395225525,
+        "L2": 7.968364715576172,
+        "L1": 2690.1337890625,
+        "SSIM": 0.0,
+        "PSNR": 33.74914959961241,
+        "Perturbed Pixels %": 89.78993892669678,
+        "High Freq Ratio": 99.96412396430969
+      }
+    },
+    "cw": {
+      "predicted_class": 627,
+      "predicted_name": "limousine",
+      "confidence": 0.045118819922208786,
+      "success": true,
+      "metrics": {
+        "L\u221e (pixel)": 0.03370445966720581,
+        "L2": 1.3716460466384888,
+        "L1": 392.28900146484375,
+        "SSIM": 0.0,
+        "PSNR": 49.03131710756134,
+        "Perturbed Pixels %": 21.40864133834839,
+        "High Freq Ratio": 97.92065024375916
+      }
+    }
+  }
+}
