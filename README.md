@@ -29,28 +29,28 @@ python ResNet.py picture
 ## 如何进行攻击运行
 - 只做正常预测：
 ```bash
-python ResNet.py example.jpg --topk 5
+python ResNet.py ./picture/example.jpg --topk 5
 ```
 
 - FGSM：
 ```bash
-python ResNet.py example.jpg --attack fgsm --eps 0.031372549 --topk 5 --save_adv adv_fgsm.png
+python ResNet.py ./picture/example.jpg --attack fgsm --eps 0.031372549 --topk 5 --save_adv adv_fgsm.png
 ```
 - PGD（更强，更容易成功）：
 ```bash
-python ResNet.py example.jpg --attack pgd --eps 0.031372549 --alpha 0.007843137 --steps 10 --topk 5 --save_adv adv_pgd.png
+python ResNet.py ./picture/example.jpg --attack pgd --eps 0.031372549 --alpha 0.007843137 --steps 10 --topk 5 --save_adv adv_pgd.png
 ``` 
 - CW-L2（较慢，建议先用较小步数验证）：
 ```bash
-python ResNet.py example.jpg --attack cw --cw_steps 10 --cw_lr 0.01 --cw_c 1.0 --topk 5 --save_adv adv_cw.png
+python ResNet.py ./picture/example.jpg --attack cw --cw_steps 10 --cw_lr 0.01 --cw_c 1.0 --topk 5 --save_adv adv_cw.png
 ```     
 - 目标攻击（把模型推到指定类别）(这个是属于CW攻击方法的）：
 ```bash
-python ResNet.py example.jpg --attack cw --target 805 --cw_steps 10 --cw_lr 0.01
+python ResNet.py ./picture/example.jpg --attack cw --target 805 --cw_steps 10 --cw_lr 0.01
 ``` 
 - 防御实验（对比攻击前和攻击后的模型预测结果）：
-```bash(例)
-python defense_experiments.py --image example.jpg --attacks fgsm pgd --eps_list 0.015686275 0.031372549
+```bash
+python defense_experiments.py --image ./picture/example.jpg --attacks fgsm pgd --eps_list 0.015686275 0.031372549
 ```
 得到结果：
 ```
