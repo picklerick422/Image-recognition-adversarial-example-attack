@@ -80,7 +80,7 @@ def iter_images(image_dir: Path):
             yield path
 
 
-# 在给定模型上做一次前向预测（包含标准化），不计算梯度
+# 在定模型上做一次前向预测（包含标准化），不计算梯度
 def predict_model(
     model: torch.nn.Module,
     x: torch.Tensor,
@@ -145,11 +145,6 @@ def main() -> None:
     except Exception:
         categories = None
 
-    # 待测试图片所在目录
-    image_dir = Path(args.image_dir)
-    if not image_dir.is_dir():
-        raise SystemExit(f"image_dir not found: {image_dir}")
-
     from torchvision.transforms import ToPILImage
 
     # 如果环境安装了 matplotlib，则开启可视化；否则只做统计
@@ -164,7 +159,15 @@ def main() -> None:
     to_pil = ToPILImage()
     vis_count = 0  # 已经保存的可视化样本数量
 
-    # 对 image_dir 下的每一张图片执行：生成对抗样本 + 在黑盒模型上评估
+    # 待测试图片所在目录
+    image_dir = Path(args.image_dir)
+    if not image_dir.is_dir():
+        raise SystemExit(f"image_dir not found: {image_dir}")
+
+    to_pil = ToPILImage()
+    vis_count = 0  # 已经保存的可视化样本数量
+
+    # 对 image_dir 下的每一张图片执行：生成对抗样本 + 在黑盒模型上评估迁移性
     for img_path in iter_images(image_dir):
         img = Image.open(img_path).convert("RGB")
         x = transform(img).unsqueeze(0).to(device)  # shape: [1, 3, 224, 224]
@@ -173,7 +176,7 @@ def main() -> None:
         logits_resnet_clean = predict_model(source_model, x, mean, std)
         y_source = logits_resnet_clean.argmax(dim=1)
 
-        # 在三个黑盒目标模型上对干净图像做预测，作为基线标签
+        # 在三个黑盒目标模型上做干净图像预测，作为基线标签
         logits_vgg_clean = predict_model(vgg19, x, mean, std)
         y_vgg_clean = logits_vgg_clean.argmax(dim=1)
 

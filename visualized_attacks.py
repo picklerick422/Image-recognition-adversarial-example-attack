@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-对抗攻击可视化分析器
-支持 FGSM / PGD / CW-L2 攻击方法的全面评估
+对抗攻击可视化分析器 v6.0 (终极修复版)
+- ✅ 完全复刻 ResNet.py 的模型加载方式 (pretrained=True)
+- ✅ 使用旧版 IMAGENET1K_V1 权重，与 ResNet.py 保持一致
+- ✅ 全局定义CPU张量 mean/std，每次动态转换
+- ✅ 消除所有与 ResNet.py 的实现差异
 """
+
 from __future__ import annotations
+
 import argparse
 import json
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,13 +25,11 @@ import torchvision.transforms as transforms
 from PIL import Image
 from torchvision.utils import save_image
 
-
-from dataclasses import dataclass
-from typing import Optional
-# ==================== 你的攻击代码（保持不变） ====================
+# ============= 屏蔽Unicode字体警告 =============
+warnings.filterwarnings("ignore", "Glyph.*missing from font", UserWarning)
 
 
-
+# ============= 攻击函数实现（保持不变） =============
 def normalize_batch(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     if mean.ndim != 1 or std.ndim != 1:
         raise ValueError("mean/std must be 1D tensors with shape [C]")
@@ -139,7 +144,7 @@ def cw_l2_attack(
             success = (logits.argmax(dim=1) == y_cmp)
         else:
             f = torch.clamp(real - other + kappa, min=0.0)
-            success = (logits.argmax(dim=1) != y_cmp)
+            success = (logits.argmax(dim=1) != y_true)
 
         l2 = (x_adv - x0).view(x0.shape[0], -1).pow(2).sum(dim=1)
         loss = (l2 + c * f).sum()
@@ -158,40 +163,62 @@ def cw_l2_attack(
     return CWResult(x_adv=final_adv, success=best_success)
 
 
-# ==================== 可视化核心类 ====================
+# ============= 全局变量（与ResNet.py完全一致） =============
+# ✅ 在模块级别定义CPU张量，与ResNet.py完全相同
+mean = torch.tensor([0.485, 0.456, 0.406])
+std = torch.tensor([0.229, 0.224, 0.225])
+transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+])
+
+
+# ============= 可视化核心类 =============
 class AttackVisualizer:
     def __init__(self, model: torch.nn.Module, device: torch.device,
-                 mean: torch.Tensor, std: torch.Tensor,
                  imagenet_classes: list = None):
         self.model = model
         self.device = device
-        self.mean = mean
-        self.std = std
+
+        # ✅ 使用 torchmetrics 计算SSIM
+        try:
+            from torchmetrics.image import StructuralSimilarityIndexMeasure
+            self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+            self.ssim_available = True
+        except ImportError:
+            print("⚠️  warning: torchmetrics未安装，SSIM将无法计算")
+            print("  请运行: pip install torchmetrics")
+            self.ssim_available = False
+
+        # 加载类别标签
         self.imagenet_classes = imagenet_classes or self._load_imagenet_classes()
 
     def _load_imagenet_classes(self) -> list:
         """加载ImageNet类别标签"""
-        import requests
-        url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
         try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                return response.text.strip().split('\n')
+            import urllib.request
+            url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
+            classes = urllib.request.urlopen(url, timeout=5).read().decode().strip().split('\n')
+            return classes
         except:
-            pass
-        # 备用：生成通用标签
-        return [f"class_{i}" for i in range(1000)]
+            return [f"class_{i}" for i in range(1000)]
 
     def denormalize(self, x: torch.Tensor) -> torch.Tensor:
         """反归一化到[0,1]"""
-        mean = self.mean.view(1, 3, 1, 1)
-        std = self.std.view(1, 3, 1, 1)
-        return torch.clamp(x * std + mean, 0.0, 1.0)
+        # ✅ 使用全局CPU张量，每次动态转换
+        mean_device = mean.to(device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std_device = std.to(device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        return torch.clamp(x * std_device + mean_device, 0.0, 1.0)
 
     def predict(self, x: torch.Tensor) -> Tuple[int, str, float]:
-        """预测并返回(类别ID, 名称, 置信度)"""
+        """✅ 与ResNet.py完全一致的推理逻辑"""
         with torch.no_grad():
-            logits = self.model(normalize_batch(x, self.mean, self.std))
+            # 使用全局CPU张量，每次动态转换（与ResNet.py完全相同）
+            mean_device = mean.to(device=x.device, dtype=x.dtype)
+            std_device = std.to(device=x.device, dtype=x.dtype)
+
+            logits = self.model(normalize_batch(x, mean_device, std_device))
             probs = F.softmax(logits, dim=1)
             pred_id = probs.argmax(dim=1).item()
             confidence = probs[0, pred_id].item()
@@ -207,32 +234,22 @@ class AttackVisualizer:
         l_2 = torch.norm(diff, p=2).item()
         l_1 = torch.norm(diff, p=1).item()
 
-        # 视觉相似度
-        x_clean_np = x_clean.cpu().numpy()
-        x_adv_np = x_adv.cpu().numpy()
-
-        # SSIM (结构相似性)
-        try:
-            from skimage.metrics import structural_similarity as ssim
-            ssim_score = ssim(
-                x_clean_np[0].transpose(1, 2, 0),
-                x_adv_np[0].transpose(1, 2, 0),
-                multichannel=True,
-                data_range=1.0
-            )
-        except ImportError:
+        # ✅ SSIM计算
+        if self.ssim_available:
+            ssim_score = self.ssim_metric(x_clean, x_adv).item()
+        else:
             ssim_score = 0.0
 
-        # PSNR (峰值信噪比)
+        # PSNR计算
         mse = torch.mean(diff ** 2).item()
-        psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
-
-        # 高频扰动比例
-        fft_diff = torch.fft.fft2(diff)
-        high_freq_ratio = (torch.abs(fft_diff) > 0.1).float().mean().item()
+        psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 1e-10 else 100.0
 
         # 扰动像素比例
-        perturbed_pixels = (torch.abs(diff) > 1 / 255).float().mean().item()
+        perturbed_pixels = (torch.abs(diff) > 1 / 255).float().mean().item() * 100
+
+        # 高频扰动比例
+        fft_diff = torch.fft.fft2(diff[0])
+        high_freq_ratio = (torch.abs(fft_diff) > torch.mean(torch.abs(fft_diff))).float().mean().item() * 100
 
         return {
             "L∞ (pixel)": l_inf,
@@ -240,26 +257,27 @@ class AttackVisualizer:
             "L1": l_1,
             "SSIM": ssim_score,
             "PSNR": psnr,
-            "Perturbed Pixels %": perturbed_pixels * 100,
-            "High Freq Ratio": high_freq_ratio * 100,
+            "Perturbed Pixels %": perturbed_pixels,
+            "High Freq Ratio %": high_freq_ratio,
         }
 
     def visualize_attack_grid(self, x_clean: torch.Tensor,
                               results: Dict[str, Dict],
                               save_path: Path = None):
-        """
-        生成攻击效果图网格：原图 + 对抗样本 + 扰动放大
-        """
+        """生成攻击效果图网格"""
         n_attacks = len(results)
         fig = plt.figure(figsize=(4 * 3, 4 * n_attacks))
 
-        # 准备数据
         x_clean_denorm = self.denormalize(x_clean).squeeze()
 
         for idx, (attack_name, result) in enumerate(results.items()):
             x_adv = result["x_adv"]
             x_adv_denorm = self.denormalize(x_adv).squeeze()
             diff = (x_adv - x_clean).squeeze()
+
+            clean_id = result["pred_clean"][0]
+            adv_id = result["pred_adv"][0]
+            success = "SUCCESS" if clean_id != adv_id else "FAILED"
 
             # Row 1: 原图 vs 对抗样本
             ax1 = plt.subplot(n_attacks, 3, idx * 3 + 1)
@@ -276,10 +294,6 @@ class AttackVisualizer:
             diff_50x = torch.clamp(x_clean_denorm + 50 * diff, 0, 1)
             self._plot_image(ax3, diff_50x, "Perturbation ×50")
 
-            # 添加攻击信息
-            pred_clean = result["pred_clean"]
-            pred_adv = result["pred_adv"]
-            success = "✅ SUCCESS" if pred_clean[0] != pred_adv[0] else "❌ FAILED"
             fig.text(0.5, 1 - (idx * (1 / n_attacks) - 0.02),
                      f"{attack_name.upper()} Attack - {success}",
                      ha='center', va='top', fontsize=14, fontweight='bold')
@@ -288,84 +302,73 @@ class AttackVisualizer:
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
+        print(f"  已保存: {save_path}")
 
     def _plot_image(self, ax, img_tensor, title):
-        """绘制单张图像"""
         img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+        img_np = np.clip(img_np, 0, 1)
         ax.imshow(img_np)
         ax.set_title(title, fontsize=11)
         ax.axis('off')
 
     def _plot_image_pair(self, ax, img1, img2, title1, title2):
-        """绘制对比图像"""
         img_np = torch.cat([img1, img2], dim=2).permute(1, 2, 0).cpu().numpy()
+        img_np = np.clip(img_np, 0, 1)
         ax.imshow(img_np)
         ax.set_title(f"{title1} vs {title2}", fontsize=11)
         ax.axis('off')
-        # 添加分割线
         h, w = img1.shape[1:]
         ax.axvline(x=w, color='white', linewidth=2)
 
     def visualize_attack_trajectory(self, x_clean: torch.Tensor, y_true: int,
                                     attack_name: str, eps: float, alpha: float, steps: int,
                                     save_path: Path = None):
-        """
-        动态展示攻击过程：置信度变化和扰动增长
-        """
+        """动态展示攻击过程"""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-        # 存储轨迹数据
         traj_probs = []
         traj_perturbs = []
 
-        # 执行攻击并记录中间结果
         x_orig = x_clean.detach()
         x_adv = x_orig.clone()
         if attack_name == "pgd":
             x_adv = (x_orig + torch.empty_like(x_orig).uniform_(-eps, eps)).clamp(0, 1)
 
         for step in range(steps + 1):
-            if step > 0:
-                if attack_name == "pgd":
-                    # PGD单步
-                    x_adv = x_adv.detach().clone().requires_grad_(True)
-                    logits = self.model(normalize_batch(x_adv, self.mean, self.std))
-                    loss = F.cross_entropy(logits, torch.tensor([y_true], device=self.device))
-                    grad = torch.autograd.grad(loss, x_adv, only_inputs=True)[0]
-                    x_adv = x_adv + alpha * grad.sign()
-                    x_adv = torch.max(torch.min(x_adv, x_orig + eps), x_orig - eps).clamp(0, 1)
-                elif attack_name == "fgsm":
-                    # FGSM一次性
-                    if step == 1:
-                        x_in = x_orig.clone().requires_grad_(True)
-                        logits = self.model(normalize_batch(x_in, self.mean, self.std))
-                        loss = F.cross_entropy(logits, torch.tensor([y_true], device=self.device))
-                        grad = torch.autograd.grad(loss, x_in, only_inputs=True)[0]
-                        x_adv = x_orig + eps * grad.sign()
-                        x_adv = x_adv.clamp(0, 1)
-                    break
-
-            # 记录当前状态
             with torch.no_grad():
-                logits = self.model(normalize_batch(x_adv, self.mean, self.std))
+                logits = self.model(normalize_batch(x_adv, mean, std))
                 probs = F.softmax(logits, dim=1)
-                traj_probs.append(probs[0, [y_true, 805]].cpu().numpy())  # 熊猫和足球
+                traj_probs.append(probs[0, [y_true, 805]].cpu().numpy())
                 traj_perturbs.append(torch.norm(x_adv - x_orig).item())
+
+            if step > 0 and attack_name == "pgd":
+                x_adv = x_adv.detach().clone().requires_grad_(True)
+                logits = self.model(normalize_batch(x_adv, mean, std))
+                loss = F.cross_entropy(logits, torch.tensor([y_true], device=self.device))
+                grad = torch.autograd.grad(loss, x_adv, only_inputs=True)[0]
+                x_adv = x_adv + alpha * grad.sign()
+                x_adv = torch.max(torch.min(x_adv, x_orig + eps), x_orig - eps).clamp(0, 1)
+            elif attack_name == "fgsm" and step == 1:
+                x_in = x_orig.clone().requires_grad_(True)
+                logits = self.model(normalize_batch(x_in, mean, std))
+                loss = F.cross_entropy(logits, torch.tensor([y_true], device=self.device))
+                grad = torch.autograd.grad(loss, x_in, only_inputs=True)[0]
+                x_adv = x_orig + eps * grad.sign()
+                x_adv = x_adv.clamp(0, 1)
+                break
 
         traj_probs = np.array(traj_probs)
 
-        # 绘制概率轨迹
-        ax1.plot(traj_probs[:, 0], label='Original Class (Panda)', color='green', linewidth=2, marker='o', markersize=3)
-        ax1.plot(traj_probs[:, 1], label='Target Class (Soccer)', color='red', linewidth=2, marker='x', markersize=3)
+        ax1.plot(traj_probs[:, 0], label='Original Class', color='green', linewidth=2, marker='o', markersize=3)
+        ax1.plot(traj_probs[:, 1], label='Target Class', color='red', linewidth=2, marker='x', markersize=3)
         ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Decision Boundary')
         ax1.set_xlabel('Attack Step', fontsize=12)
         ax1.set_ylabel('Prediction Probability', fontsize=12)
-        ax1.set_title(f'{attack_name.upper()} Attack Trajectory (Eps={eps:.3f})', fontsize=14)
+        ax1.set_title(f'{attack_name.upper()} Attack Trajectory (Eps={eps:.5f})', fontsize=14)
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
         ax1.set_ylim(-0.05, 1.05)
 
-        # 绘制扰动增长
         ax2.plot(traj_perturbs, color='purple', linewidth=2, marker='s', markersize=3)
         ax2.set_xlabel('Attack Step', fontsize=12)
         ax2.set_ylabel('L2 Perturbation', fontsize=12)
@@ -376,33 +379,32 @@ class AttackVisualizer:
         if save_path:
             plt.savefig(save_path, dpi=300)
         plt.show()
+        print(f"  已保存: {save_path}")
 
     def visualize_perturbation_analysis(self, x_clean: torch.Tensor,
                                         results: Dict[str, Dict],
                                         save_path: Path = None):
-        """
-        扰动的频域和空域分析
-        """
+        """扰动的频域和空域分析"""
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         fig.suptitle('Perturbation Spatial & Frequency Analysis', fontsize=16, fontweight='bold')
 
-        # 1. 空域分布直方图
         for idx, (attack_name, result) in enumerate(results.items()):
             diff = (result["x_adv"] - x_clean).squeeze().cpu().numpy()
-            axes[0, idx].hist(diff.flatten(), bins=50, alpha=0.7, color=['red', 'blue', 'purple'][idx])
-            axes[0, idx].set_title(f'{attack_name.upper()} Perturbation Distribution', fontsize=12)
+            axes[0, idx].hist(diff.flatten(), bins=50, alpha=0.7,
+                              color=['red', 'blue', 'purple'][idx],
+                              range=(-0.1, 0.1))
+            axes[0, idx].set_title(f'{attack_name.upper()} Distribution', fontsize=12)
             axes[0, idx].set_xlabel('Perturbation Value')
             axes[0, idx].set_ylabel('Frequency')
             axes[0, idx].grid(True, alpha=0.3)
 
-        # 2. 频域分析
         for idx, (attack_name, result) in enumerate(results.items()):
             diff = (result["x_adv"] - x_clean).squeeze().cpu().numpy()
             fft_diff = np.fft.fft2(diff.transpose(1, 2, 0).mean(axis=2))
             fft_magnitude = np.abs(np.fft.fftshift(fft_diff))
 
             im = axes[1, idx].imshow(np.log1p(fft_magnitude), cmap='hot')
-            axes[1, idx].set_title(f'{attack_name.upper()} Frequency Spectrum', fontsize=12)
+            axes[1, idx].set_title(f'{attack_name.upper()} Frequency', fontsize=12)
             axes[1, idx].axis('off')
             plt.colorbar(im, ax=axes[1, idx], fraction=0.046, pad=0.04)
 
@@ -410,6 +412,7 @@ class AttackVisualizer:
         if save_path:
             plt.savefig(save_path, dpi=300)
         plt.show()
+        print(f"  已保存: {save_path}")
 
     def save_adv_images(self, results: Dict[str, Dict], output_dir: Path):
         """保存所有对抗样本图像"""
@@ -418,45 +421,40 @@ class AttackVisualizer:
             x_adv = self.denormalize(result["x_adv"])
             save_path = output_dir / f"adv_{attack_name}.png"
             save_image(x_adv, save_path)
-            print(f"  Saved: {save_path}")
+            print(f"    {save_path}")
 
 
-# ==================== 主执行流程 ====================
+# ============= 模型和数据加载 =============
 def load_model(device: torch.device, model_name: str = "resnet50") -> torch.nn.Module:
-    """加载预训练模型"""
+    """✅ 加载预训练模型（与ResNet.py完全一致）"""
     print(f"Loading {model_name}...")
-    try:
-        if model_name == "resnet50":
-            model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        elif model_name == "vgg19":
-            model = models.vgg19(weights=models.VGG19_Weights.DEFAULT)
-        else:
-            raise ValueError(f"Unsupported model: {model_name}")
-    except:
-        # 回退到旧版API
-        model = getattr(models, model_name)(pretrained=True)
 
-    return model.eval().to(device)
+    # ✅ 核心修复：使用pretrained=True而非weights=...，确保加载相同权重版本
+    model = getattr(models, model_name)(pretrained=True).eval()
+
+    return model.to(device)
 
 
 def get_imagenet_transform() -> transforms.Compose:
     """ImageNet标准化预处理"""
-    return transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])
+    return transform  # 使用全局变量
 
 
-def get_mean_std(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """ImageNet均值方差"""
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device)
-    return mean, std
+def get_device():
+    """获取计算设备"""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# ============= 主执行流程 =============
 def main():
-    parser = argparse.ArgumentParser(description="对抗攻击可视化分析器")
+    parser = argparse.ArgumentParser(
+        description="对抗攻击可视化分析器 v6.0 (最终权重修复版)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="示例:\n"
+               "  python visualize_attacks.py --image picture/example.jpg\n"
+               "  python visualize_attacks.py --image picture/example.jpg --eps 0.062745 --steps 40\n"
+               "  python visualize_attacks.py --image picture/example.jpg --cw_c 0.1 --cw_steps 500"
+    )
 
     # 输入设置
     parser.add_argument("--image", type=str, required=True, help="输入图像路径")
@@ -478,13 +476,15 @@ def main():
     args = parser.parse_args()
 
     # 设备设置
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"使用设备: {device}")
+    if not torch.cuda.is_available():
+        print("⚠️  警告: 未检测到CUDA，CPU模式会非常慢")
 
-    # 加载模型和图像
+    # 加载模型（✅ 使用与ResNet.py完全相同的方式）
     model = load_model(device, args.model)
-    transform = get_imagenet_transform()
 
+    # 加载图像
     image_path = Path(args.image)
     if not image_path.exists():
         raise FileNotFoundError(f"图像不存在: {image_path}")
@@ -492,70 +492,54 @@ def main():
     img = Image.open(image_path).convert("RGB")
     x_clean = transform(img).unsqueeze(0).to(device)
 
-    # 获取均值方差
-    mean, std = get_mean_std(device)
+    # 初始化可视化器（✅ 不传mean/std，使用全局变量）
+    visualizer = AttackVisualizer(model, device)
 
-    # 初始化可视化器
-    visualizer = AttackVisualizer(model, device, mean, std)
-
-    # 获取真实标签（使用模型预测作为伪标签）
+    # 获取真实标签（现在与ResNet.py完全一致）
     clean_pred_id, clean_pred_name, clean_prob = visualizer.predict(x_clean)
     print(f"\n{'=' * 60}")
     print(f"🖼️  输入图像: {image_path.name}")
     print(f"🎯 真实标签: {clean_pred_name} (class {clean_pred_id})")
-    print(f"📊 置信度: {clean_prob:.4f}")
+    print(f"📊 置信度: {clean_prob:.4f}")  # 必须显示0.997
     print(f"{'=' * 60}")
 
-    # 执行三种攻击
+    # 执行三种攻击（✅ 传递全局CPU张量给攻击函数）
     print("\n⚔️  正在执行攻击...")
     results = {}
 
-    # 1. FGSM攻击
-    print("  执行 FGSM...")
-    x_fgsm = fgsm_attack(model, x_clean, torch.tensor([clean_pred_id], device=device),
-                         eps=args.eps, mean=mean, std=std)
-    fgsm_pred = visualizer.predict(x_fgsm)
-    results["fgsm"] = {
-        "x_adv": x_fgsm,
-        "pred_clean": (clean_pred_id, clean_pred_name, clean_prob),
-        "pred_adv": fgsm_pred,
-    }
+    for attack_name in ["fgsm", "pgd", "cw"]:
+        print(f"  执行 {attack_name.upper()}...")
 
-    # 2. PGD攻击
-    print("  执行 PGD...")
-    x_pgd = pgd_linf_attack(model, x_clean, torch.tensor([clean_pred_id], device=device),
-                            eps=args.eps, alpha=args.alpha, steps=args.steps,
-                            mean=mean, std=std)
-    pgd_pred = visualizer.predict(x_pgd)
-    results["pgd"] = {
-        "x_adv": x_pgd,
-        "pred_clean": (clean_pred_id, clean_pred_name, clean_prob),
-        "pred_adv": pgd_pred,
-    }
+        if attack_name == "fgsm":
+            x_adv = fgsm_attack(model, x_clean, torch.tensor([clean_pred_id], device=device),
+                                eps=args.eps, mean=mean, std=std)  # ✅ 传递全局CPU张量
+        elif attack_name == "pgd":
+            x_adv = pgd_linf_attack(model, x_clean, torch.tensor([clean_pred_id], device=device),
+                                    eps=args.eps, alpha=args.alpha, steps=args.steps,
+                                    mean=mean, std=std)  # ✅ 传递全局CPU张量
+        else:  # cw
+            cw_result = cw_l2_attack(model, x_clean, torch.tensor([clean_pred_id], device=device),
+                                     mean=mean, std=std, c=args.cw_c, kappa=0.0,
+                                     steps=args.cw_steps, lr=0.01)  # ✅ 传递全局CPU张量
+            x_adv = cw_result.x_adv
 
-    # 3. CW-L2攻击
-    print("  执行 CW-L2...")
-    cw_result = cw_l2_attack(model, x_clean, torch.tensor([clean_pred_id], device=device),
-                             mean=mean, std=std, c=args.cw_c, kappa=0.0,
-                             steps=args.cw_steps, lr=0.01)
-    x_cw = cw_result.x_adv
-    cw_pred = visualizer.predict(x_cw)
-    results["cw"] = {
-        "x_adv": x_cw,
-        "pred_clean": (clean_pred_id, clean_pred_name, clean_prob),
-        "pred_adv": cw_pred,
-        "success": cw_result.success.item(),
-    }
+        # 获取预测结果（使用修复后的predict方法）
+        adv_pred = visualizer.predict(x_adv)
+
+        results[attack_name] = {
+            "x_adv": x_adv,
+            "pred_clean": (clean_pred_id, clean_pred_name, clean_prob),
+            "pred_adv": adv_pred,
+        }
 
     # 创建输出目录
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ==================== 生成可视化 ====================
+    # ============= 生成可视化 =============
     print("\n📊 正在生成可视化...")
 
-    # 1. 攻击效果网格图
-    print("  生成攻击效果对比图...")
+    # 1. 攻击效果对比图
     visualizer.visualize_attack_grid(
         x_clean, results,
         save_path=output_dir / "attack_comparison.png"
@@ -580,16 +564,24 @@ def main():
     print("\n📈 定量评估指标:")
     print("-" * 80)
     for attack_name, result in results.items():
-        print(f"\n{attack_name.upper()}攻击:")
-        print(f"  预测变化: {result['pred_clean'][1]} ({result['pred_clean'][2]:.4f}) → "
-              f"{result['pred_adv'][1]} ({result['pred_adv'][2]:.4f})")
+        clean_info = result["pred_clean"]
+        adv_info = result["pred_adv"]
+
+        # 判断攻击是否成功
+        success = "SUCCESS" if clean_info[0] != adv_info[0] else "FAILED"
+        print(f"\n{attack_name.upper()}攻击 [{success}]:")
+        print(f"  预测变化: {clean_info[1]} ({clean_info[2]:.4f}) → "
+              f"{adv_info[1]} ({adv_info[2]:.4f})")
 
         metrics = visualizer.calculate_metrics(x_clean, result["x_adv"])
         for metric, value in metrics.items():
-            if "SSIM" in metric or "PSNR" in metric:
-                print(f"  {metric}: {value:.4f}")
+            if isinstance(value, float):
+                if "SSIM" in metric or "PSNR" in metric:
+                    print(f"  {metric:.<25} {value:.4f}")
+                else:
+                    print(f"  {metric:.<25} {value:.6f}")
             else:
-                print(f"  {metric}: {value:.6f}")
+                print(f"  {metric:.<25} {value}")
 
     # 5. 保存对抗样本图像
     if args.save_images:
@@ -598,16 +590,23 @@ def main():
 
     # 6. 生成JSON报告
     report = {
-        "image": str(image_path),
+        "image": str(image_path.absolute()),
         "model": args.model,
         "clean_prediction": {
             "class_id": int(clean_pred_id),
             "class_name": clean_pred_name,
             "confidence": float(clean_prob)
         },
+        "params": {
+            "eps": float(args.eps),
+            "alpha": float(args.alpha),
+            "steps": int(args.steps),
+            "cw_c": float(args.cw_c),
+            "cw_steps": int(args.cw_steps)
+        },
         "attacks": {
             name: {
-                "predicted_class": int(result["pred_adv"][0]),
+                "predicted_class": int(result["pred_adj"][0]),
                 "predicted_name": result["pred_adv"][1],
                 "confidence": float(result["pred_adv"][2]),
                 "success": result["pred_clean"][0] != result["pred_adv"][0],
@@ -617,12 +616,39 @@ def main():
         }
     }
 
-    with open(output_dir / "attack_report.json", "w") as f:
-        json.dump(report, f, indent=2, default=str)
+    # 保存报告时处理numpy数据类型
+    def json_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.float32):
+            return float(obj)
+        elif isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist()
+        return obj
+
+    with open(output_dir / "attack_report.json", "w", encoding='utf-8') as f:
+        json.dump(report, f, indent=2, default=json_serializable, ensure_ascii=False)
 
     print(f"\n✅ 所有结果已保存到: {output_dir}")
     print(f"📄 JSON报告: {output_dir / 'attack_report.json'}")
+    print(f"\n🎉 完成！请检查输出目录中的PNG图片。")
 
 
+# ============= 入口 & 依赖检查 =============
 if __name__ == "__main__":
+    # 检查关键依赖
+    try:
+        import torchmetrics
+    except ImportError:
+        print("❌ 错误: torchmetrics未安装")
+        print("   请运行: pip install torchmetrics")
+        exit(1)
+
+    try:
+        import matplotlib
+    except ImportError:
+        print("❌ 错误: matplotlib未安装")
+        print("   请运行: pip install matplotlib")
+        exit(1)
+
     main()
